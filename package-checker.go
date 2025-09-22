@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -47,6 +49,20 @@ var defaultPackages = []Package{
 	{Name: "chalk", Version: "5.6.1"},
 	{Name: "debug", Version: "4.4.2"},
 	{Name: "ansi-styles", Version: "6.2.2"},
+}
+
+const (
+	packageManagerPNPM = "pnpm"
+	packageManagerYarn = "yarn"
+	packageManagerNPM  = "npm"
+
+	minPackageParts = 2
+)
+
+func closeResource(closer io.Closer, name string) {
+	if err := closer.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️ リソースのクローズに失敗しました (%s): %v\n", name, err)
+	}
 }
 
 func main() {
@@ -93,21 +109,21 @@ func main() {
 func detectPackageManager() string {
 	// 1. ロックファイルの存在確認（優先度順）
 	if fileExists("pnpm-lock.yaml") {
-		return "pnpm"
+		return packageManagerPNPM
 	}
 	if fileExists("yarn.lock") {
-		return "yarn"
+		return packageManagerYarn
 	}
 	if fileExists("package-lock.json") {
-		return "npm"
+		return packageManagerNPM
 	}
 
 	// 2. node_modulesの特殊フォルダ確認
 	if fileExists("node_modules/.pnpm") {
-		return "pnpm"
+		return packageManagerPNPM
 	}
 	if fileExists("node_modules/.yarn-integrity") {
-		return "yarn"
+		return packageManagerYarn
 	}
 
 	// 3. package.jsonのpackageManagerフィールド確認
@@ -116,12 +132,13 @@ func detectPackageManager() string {
 	}
 
 	// 4. インストール状況確認（優先度順）
-	if isCommandAvailable("pnpm") {
-		return "pnpm"
-	} else if isCommandAvailable("yarn") {
-		return "yarn"
-	} else if isCommandAvailable("npm") {
-		return "npm"
+	switch {
+	case isCommandAvailable(packageManagerPNPM):
+		return packageManagerPNPM
+	case isCommandAvailable(packageManagerYarn):
+		return packageManagerYarn
+	case isCommandAvailable(packageManagerNPM):
+		return packageManagerNPM
 	}
 
 	return ""
@@ -145,37 +162,40 @@ func getPackageManagerFromPackageJson() string {
 	if !fileExists("package.json") {
 		return ""
 	}
-	
+
 	file, err := os.Open("package.json")
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
-	
+	defer closeResource(file, "package.json")
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.Contains(line, "\"packageManager\"") {
 			// "packageManager": "pnpm@8.6.0" のような形式から抽出
-			if strings.Contains(line, "pnpm") {
-				return "pnpm"
-			} else if strings.Contains(line, "yarn") {
-				return "yarn"
-			} else if strings.Contains(line, "npm") {
-				return "npm"
+			switch {
+			case strings.Contains(line, packageManagerPNPM):
+				return packageManagerPNPM
+			case strings.Contains(line, packageManagerYarn):
+				return packageManagerYarn
+			case strings.Contains(line, packageManagerNPM):
+				return packageManagerNPM
 			}
 		}
 	}
-	
+
 	return ""
 }
 
 func (c *Checker) loadPackages(filename string) error {
-	file, err := os.Open(filename)
+	cleanedFilename := filepath.Clean(filename)
+	// #nosec G304 -- ユーザー入力は正規化した上で利用し、読み取り専用で開く
+	file, err := os.Open(cleanedFilename)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer closeResource(file, cleanedFilename)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -198,7 +218,7 @@ func (c *Checker) loadPackages(filename string) error {
 					Version: "",
 				})
 			}
-		} else if len(parts) >= 2 {
+		} else if len(parts) >= minPackageParts {
 			c.Packages = append(c.Packages, Package{
 				Name:    parts[0],
 				Version: parts[1],
@@ -243,14 +263,18 @@ func (c *Checker) checkPackage(pkg Package) {
 	var cmd *exec.Cmd
 	var notFoundPattern string
 
-	if c.PackageManager == "pnpm" {
-		cmd = exec.Command("pnpm", "why", "-r", pkg.Name)
+	switch c.PackageManager {
+	case packageManagerPNPM:
+		// #nosec G204 -- コマンドと引数は固定で安全に使用する
+		cmd = exec.Command(packageManagerPNPM, "why", "-r", pkg.Name)
 		notFoundPattern = "✕ Couldn't find any"
-	} else if c.PackageManager == "yarn" {
-		cmd = exec.Command("yarn", "why", pkg.Name)
+	case packageManagerYarn:
+		// #nosec G204 -- コマンドと引数は固定で安全に使用する
+		cmd = exec.Command(packageManagerYarn, "why", pkg.Name)
 		notFoundPattern = "error Package"
-	} else {
-		cmd = exec.Command("npm", "ls", pkg.Name)
+	default:
+		// #nosec G204 -- コマンドと引数は固定で安全に使用する
+		cmd = exec.Command(packageManagerNPM, "ls", pkg.Name)
 		notFoundPattern = "npm ERR!"
 	}
 
@@ -269,31 +293,32 @@ func (c *Checker) checkPackage(pkg Package) {
 	}
 
 	// パッケージマネージャー別のバージョンチェック
-	if pkg.Version != "" {
+	switch {
+	case pkg.Version != "":
 		switch c.PackageManager {
-		case "pnpm":
+		case packageManagerPNPM:
 			c.checkPnpmVersion(pkg, outputStr)
-		case "yarn":
+		case packageManagerYarn:
 			c.checkYarnVersion(pkg, outputStr)
 		default:
 			c.checkNpmVersion(pkg, outputStr)
 		}
-	} else if strings.Contains(outputStr, pkg.Name) {
+	case strings.Contains(outputStr, pkg.Name):
 		fmt.Println("📦 FOUND")
-	} else {
+	default:
 		fmt.Println("❓ MISSING")
 	}
 
 	// パッケージ名を含む関連行のみ表示
 	lines := strings.Split(outputStr, "\n")
 	relevantLines := []string{}
-	
+
 	for _, line := range lines {
 		if line != "" && strings.Contains(line, pkg.Name) {
 			relevantLines = append(relevantLines, line)
 		}
 	}
-	
+
 	if len(relevantLines) > 0 {
 		fmt.Println("関連する依存関係:")
 		for _, line := range relevantLines {
