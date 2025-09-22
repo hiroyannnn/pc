@@ -84,9 +84,9 @@ jobs:
         go-version: 1.25
 
     - name: Run Gosec Security Scanner
-      uses: securecodewarrior/github-action-gosec@master
-      with:
-        args: './...'
+      run: |
+        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+        gosec ./...
 
   build-cross-platform:
     name: Build Cross Platform

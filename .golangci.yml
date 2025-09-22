@@ -1,11 +1,8 @@
 run:
+  go: "1.24"
   timeout: 5m
   issues-exit-code: 1
   tests: true
-  skip-dirs:
-    - vendor
-  skip-files:
-    - ".*_test.go"
 
 linters-settings:
   errcheck:
@@ -16,13 +13,13 @@ linters-settings:
     min-complexity: 15
 
   govet:
-    check-shadowing: true
+    enable:
+      - shadow
 
   misspell:
     locale: US
 
   unused:
-    check-exported: false
 
   gosec:
     excludes:
@@ -32,23 +29,18 @@ linters-settings:
 linters:
   enable:
     - bodyclose
-    - deadcode
-    - depguard
     - dogsled
     - dupl
     - errcheck
-    - exportloopref
+    - copyloopvar
     - exhaustive
     - gochecknoinits
     - goconst
     - gocritic
     - gocyclo
-    - gofmt
-    - goimports
-    - gomnd
+    - mnd
     - goprintffuncname
     - gosec
-    - gosimple
     - govet
     - ineffassign
     - misspell
@@ -57,29 +49,19 @@ linters:
     - nolintlint
     - rowserrcheck
     - staticcheck
-    - structcheck
-    - stylecheck
-    - typecheck
     - unconvert
     - unparam
     - unused
-    - varcheck
     - whitespace
 
-  disable:
-    - gochecknoglobals  # グローバル変数の使用は制限しない
-    - godox            # TODOコメントは許可
-    - gofumpt          # gofmtで十分
-    - nlreturn         # 改行ルールは緩める
 
 issues:
   exclude-rules:
     - path: _test\.go
       linters:
-        - gomnd
+        - mnd
         - goconst
         - dupl
 
   max-issues-per-linter: 0
   max-same-issues: 0
-  new: false
