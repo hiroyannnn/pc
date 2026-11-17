@@ -2,9 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -21,13 +25,11 @@ type Checker struct {
 	Packages       []Package
 }
 
-// CLI引数の構造体定義
 type CLI struct {
 	File string `arg:"" optional:"" type:"path" help:"パッケージリストファイル (省略時はデフォルトリストを使用)"`
 	PM   string `short:"p" long:"pm" default:"auto" enum:"npm,pnpm,yarn,auto" help:"パッケージマネージャー (npm/pnpm/yarn/auto)"`
 }
 
-// デフォルトのパッケージリスト
 var defaultPackages = []Package{
 	{Name: "backslash", Version: "0.2.1"},
 	{Name: "chalk-template", Version: "1.1.1"},
@@ -49,22 +51,36 @@ var defaultPackages = []Package{
 	{Name: "ansi-styles", Version: "6.2.2"},
 }
 
+const (
+	packageManagerPNPM = "pnpm"
+	packageManagerYarn = "yarn"
+	packageManagerNPM  = "npm"
+
+	minPackageParts     = 2
+	interruptedExitCode = 130 // 128 + SIGINT, as shells conventionally report interrupted commands.
+)
+
+func closeResource(closer io.Closer, name string) {
+	if err := closer.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️ リソースのクローズに失敗しました (%s): %v\n", name, err)
+	}
+}
+
 func main() {
 	var cli CLI
-	ctx := kong.Parse(&cli,
+	cliCtx := kong.Parse(&cli,
 		kong.Name("pc"),
 		kong.Description("📦 Node.jsパッケージの依存関係チェックツール"),
 		kong.UsageOnError(),
 	)
 
-	// パッケージマネージャーの自動検出
 	packageManager := cli.PM
 	if packageManager == "auto" {
 		detected := detectPackageManager()
 		if detected == "" {
 			fmt.Println("❌ エラー: パッケージマネージャーを自動検出できませんでした")
 			fmt.Println("npm または pnpm を明示的に指定してください")
-			ctx.Exit(1)
+			cliCtx.Exit(1)
 		}
 		packageManager = detected
 		fmt.Printf("🔍 パッケージマネージャーを自動検出しました: %s\n", packageManager)
@@ -74,11 +90,10 @@ func main() {
 		PackageManager: packageManager,
 	}
 
-	// ファイルが指定されていればファイルから読み込み、なければデフォルトを使用
 	if cli.File != "" {
 		if err := checker.loadPackages(cli.File); err != nil {
 			fmt.Printf("❌ ファイル読み込みエラー: %v\n", err)
-			ctx.Exit(1)
+			cliCtx.Exit(1)
 		}
 		fmt.Printf("📂 ファイルからパッケージリストを読み込みました: %s\n", cli.File)
 	} else {
@@ -86,96 +101,94 @@ func main() {
 		fmt.Println("📦 デフォルトのパッケージリストを使用します")
 	}
 
-	checker.checkPackages()
+	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if !checker.checkPackages(runContext) {
+		cliCtx.Exit(interruptedExitCode)
+	}
 }
 
-// パッケージマネージャーの自動検出
 func detectPackageManager() string {
-	// 1. ロックファイルの存在確認（優先度順）
 	if fileExists("pnpm-lock.yaml") {
-		return "pnpm"
+		return packageManagerPNPM
 	}
 	if fileExists("yarn.lock") {
-		return "yarn"
+		return packageManagerYarn
 	}
 	if fileExists("package-lock.json") {
-		return "npm"
+		return packageManagerNPM
 	}
 
-	// 2. node_modulesの特殊フォルダ確認
 	if fileExists("node_modules/.pnpm") {
-		return "pnpm"
+		return packageManagerPNPM
 	}
 	if fileExists("node_modules/.yarn-integrity") {
-		return "yarn"
+		return packageManagerYarn
 	}
 
-	// 3. package.jsonのpackageManagerフィールド確認
 	if pm := getPackageManagerFromPackageJson(); pm != "" {
 		return pm
 	}
 
-	// 4. インストール状況確認（優先度順）
-	if isCommandAvailable("pnpm") {
-		return "pnpm"
-	} else if isCommandAvailable("yarn") {
-		return "yarn"
-	} else if isCommandAvailable("npm") {
-		return "npm"
+	switch {
+	case isCommandAvailable(packageManagerPNPM):
+		return packageManagerPNPM
+	case isCommandAvailable(packageManagerYarn):
+		return packageManagerYarn
+	case isCommandAvailable(packageManagerNPM):
+		return packageManagerNPM
 	}
 
 	return ""
 }
 
-// ファイルの存在確認
 func fileExists(filename string) bool {
 	_, err := os.Stat(filename)
 	return !os.IsNotExist(err)
 }
 
-// コマンドが利用可能かチェック
 func isCommandAvailable(command string) bool {
-	cmd := exec.Command("which", command)
-	err := cmd.Run()
+	_, err := exec.LookPath(command)
 	return err == nil
 }
 
-// package.json から packageManager フィールドを取得
 func getPackageManagerFromPackageJson() string {
 	if !fileExists("package.json") {
 		return ""
 	}
-	
+
 	file, err := os.Open("package.json")
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
-	
+	defer closeResource(file, "package.json")
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.Contains(line, "\"packageManager\"") {
-			// "packageManager": "pnpm@8.6.0" のような形式から抽出
-			if strings.Contains(line, "pnpm") {
-				return "pnpm"
-			} else if strings.Contains(line, "yarn") {
-				return "yarn"
-			} else if strings.Contains(line, "npm") {
-				return "npm"
+			switch {
+			case strings.Contains(line, packageManagerPNPM):
+				return packageManagerPNPM
+			case strings.Contains(line, packageManagerYarn):
+				return packageManagerYarn
+			case strings.Contains(line, packageManagerNPM):
+				return packageManagerNPM
 			}
 		}
 	}
-	
+
 	return ""
 }
 
 func (c *Checker) loadPackages(filename string) error {
-	file, err := os.Open(filename)
+	cleanedFilename := filepath.Clean(filename)
+	// #nosec G304 -- CLI の指定ファイルを読む機能のため、利用者が選んだパスを受け入れる
+	file, err := os.Open(cleanedFilename)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer closeResource(file, cleanedFilename)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -198,7 +211,7 @@ func (c *Checker) loadPackages(filename string) error {
 					Version: "",
 				})
 			}
-		} else if len(parts) >= 2 {
+		} else if len(parts) >= minPackageParts {
 			c.Packages = append(c.Packages, Package{
 				Name:    parts[0],
 				Version: parts[1],
@@ -217,21 +230,35 @@ func (c *Checker) loadPackages(filename string) error {
 	return nil
 }
 
-func (c *Checker) checkPackages() {
+func hasMissingPackageOutput(err error, output, notFoundPattern, packageName string) bool {
+	return err != nil && strings.Contains(output, notFoundPattern) ||
+		strings.Contains(output, "Legend:") && !strings.Contains(output, packageName+" ")
+}
+
+func (c *Checker) checkPackages(ctx context.Context) bool {
 	fmt.Printf("🔍 使用するパッケージマネージャー: %s\n", c.PackageManager)
 	fmt.Println("パッケージの依存関係をチェックしています...")
 	fmt.Println("=========================================")
 
 	for _, pkg := range c.Packages {
-		c.checkPackage(pkg)
+		if ctx.Err() != nil {
+			break
+		}
+		c.checkPackage(ctx, pkg)
+	}
+
+	if ctx.Err() != nil {
+		fmt.Println("⏹️ チェックを中断しました")
+		return false
 	}
 
 	fmt.Println()
 	fmt.Println("=========================================")
 	fmt.Println("チェック完了")
+	return true
 }
 
-func (c *Checker) checkPackage(pkg Package) {
+func (c *Checker) checkPackage(ctx context.Context, pkg Package) {
 	fmt.Println()
 	if pkg.Version != "" {
 		fmt.Printf("📦 %s (%s)\n", pkg.Name, pkg.Version)
@@ -243,57 +270,57 @@ func (c *Checker) checkPackage(pkg Package) {
 	var cmd *exec.Cmd
 	var notFoundPattern string
 
-	if c.PackageManager == "pnpm" {
-		cmd = exec.Command("pnpm", "why", "-r", pkg.Name)
+	switch c.PackageManager {
+	case packageManagerPNPM:
+		// #nosec G204 -- パッケージ名はシェル解釈を経ず、1つのコマンドライン引数として渡す
+		cmd = exec.CommandContext(ctx, packageManagerPNPM, "why", "-r", pkg.Name)
 		notFoundPattern = "✕ Couldn't find any"
-	} else if c.PackageManager == "yarn" {
-		cmd = exec.Command("yarn", "why", pkg.Name)
+	case packageManagerYarn:
+		// #nosec G204 -- パッケージ名はシェル解釈を経ず、1つのコマンドライン引数として渡す
+		cmd = exec.CommandContext(ctx, packageManagerYarn, "why", pkg.Name)
 		notFoundPattern = "error Package"
-	} else {
-		cmd = exec.Command("npm", "ls", pkg.Name)
+	default:
+		// #nosec G204 -- パッケージ名はシェル解釈を経ず、1つのコマンドライン引数として渡す
+		cmd = exec.CommandContext(ctx, packageManagerNPM, "ls", pkg.Name)
 		notFoundPattern = "npm ERR!"
 	}
 
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return
+	}
 	outputStr := string(output)
 
-	if err != nil && strings.Contains(outputStr, notFoundPattern) {
+	if hasMissingPackageOutput(err, outputStr, notFoundPattern, pkg.Name) {
 		fmt.Println("❓ MISSING")
 		return
 	}
 
-	// パッケージが見つからない場合の追加チェック
-	if strings.Contains(outputStr, "Legend:") && !strings.Contains(outputStr, pkg.Name+" ") {
-		fmt.Println("❓ MISSING")
-		return
-	}
-
-	// パッケージマネージャー別のバージョンチェック
-	if pkg.Version != "" {
+	switch {
+	case pkg.Version != "":
 		switch c.PackageManager {
-		case "pnpm":
+		case packageManagerPNPM:
 			c.checkPnpmVersion(pkg, outputStr)
-		case "yarn":
+		case packageManagerYarn:
 			c.checkYarnVersion(pkg, outputStr)
 		default:
 			c.checkNpmVersion(pkg, outputStr)
 		}
-	} else if strings.Contains(outputStr, pkg.Name) {
+	case strings.Contains(outputStr, pkg.Name):
 		fmt.Println("📦 FOUND")
-	} else {
+	default:
 		fmt.Println("❓ MISSING")
 	}
 
-	// パッケージ名を含む関連行のみ表示
 	lines := strings.Split(outputStr, "\n")
 	relevantLines := []string{}
-	
+
 	for _, line := range lines {
 		if line != "" && strings.Contains(line, pkg.Name) {
 			relevantLines = append(relevantLines, line)
 		}
 	}
-	
+
 	if len(relevantLines) > 0 {
 		fmt.Println("関連する依存関係:")
 		for _, line := range relevantLines {
@@ -302,11 +329,7 @@ func (c *Checker) checkPackage(pkg Package) {
 	}
 }
 
-// pnpm用のバージョンチェック
 func (c *Checker) checkPnpmVersion(pkg Package, outputStr string) {
-	// パターン1: └── パッケージ名 バージョン
-	// パターン2: │ └── パッケージ名 バージョン
-	// パターン3: └─┬ パッケージ名 バージョン
 	patterns := []string{
 		fmt.Sprintf(`[└├]─+.*%s %s`, regexp.QuoteMeta(pkg.Name), regexp.QuoteMeta(pkg.Version)),
 		fmt.Sprintf(`%s %s$`, regexp.QuoteMeta(pkg.Name), regexp.QuoteMeta(pkg.Version)),
@@ -314,7 +337,11 @@ func (c *Checker) checkPnpmVersion(pkg Package, outputStr string) {
 
 	var matched bool
 	for _, pattern := range patterns {
-		if matched, _ = regexp.MatchString(pattern, outputStr); matched {
+		var err error
+		if matched, err = regexp.MatchString(pattern, outputStr); err != nil {
+			continue
+		}
+		if matched {
 			break
 		}
 	}
@@ -322,7 +349,6 @@ func (c *Checker) checkPnpmVersion(pkg Package, outputStr string) {
 	if matched {
 		fmt.Printf("🎯 MATCH: %s\n", pkg.Version)
 	} else {
-		// 実際のバージョンを取得 - より幅広いパターンに対応
 		versionPatterns := []string{
 			fmt.Sprintf(`[└├│]─+.*%s ([0-9]+\.[0-9]+\.[0-9]+[^\s]*)`, regexp.QuoteMeta(pkg.Name)),
 			fmt.Sprintf(`%s ([0-9]+\.[0-9]+\.[0-9]+[^\s]*)`, regexp.QuoteMeta(pkg.Name)),
@@ -341,7 +367,6 @@ func (c *Checker) checkPnpmVersion(pkg Package, outputStr string) {
 		}
 
 		if len(versions) > 0 {
-			// 重複を除去
 			uniqueVersions := make(map[string]bool)
 			for _, v := range versions {
 				uniqueVersions[v] = true
@@ -357,17 +382,12 @@ func (c *Checker) checkPnpmVersion(pkg Package, outputStr string) {
 	}
 }
 
-// yarn用のバージョンチェック
 func (c *Checker) checkYarnVersion(pkg Package, outputStr string) {
-	// yarn whyの出力形式:
-	// └─ パッケージ名@バージョン
-	// ├─ パッケージ名@バージョン
 	exactPattern := fmt.Sprintf(`[└├]─ %s@%s`, regexp.QuoteMeta(pkg.Name), regexp.QuoteMeta(pkg.Version))
 
-	if matched, _ := regexp.MatchString(exactPattern, outputStr); matched {
+	if matched, err := regexp.MatchString(exactPattern, outputStr); err == nil && matched {
 		fmt.Printf("🎯 MATCH: %s\n", pkg.Version)
 	} else {
-		// 実際のバージョンを取得
 		versionPattern := fmt.Sprintf(`[└├]─ %s@([0-9]+\.[0-9]+\.[0-9]+[^\s]*)`, regexp.QuoteMeta(pkg.Name))
 		re := regexp.MustCompile(versionPattern)
 		matches := re.FindAllStringSubmatch(outputStr, -1)
@@ -380,7 +400,6 @@ func (c *Checker) checkYarnVersion(pkg Package, outputStr string) {
 		}
 
 		if len(versions) > 0 {
-			// 重複を除去
 			uniqueVersions := make(map[string]bool)
 			for _, v := range versions {
 				uniqueVersions[v] = true
@@ -396,7 +415,6 @@ func (c *Checker) checkYarnVersion(pkg Package, outputStr string) {
 	}
 }
 
-// npm用のバージョンチェック
 func (c *Checker) checkNpmVersion(pkg Package, outputStr string) {
 	if strings.Contains(outputStr, pkg.Version) {
 		fmt.Printf("🎯 MATCH: %s\n", pkg.Version)
